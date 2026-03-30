@@ -1,9 +1,9 @@
 import base64
-import io
-import os
-import random
 import asyncio
-from typing import List
+import json
+
+from Crypto.Cipher import AES
+from Crypto.Util.Padding import pad
 
 import httpx
 from fastapi import FastAPI, HTTPException
@@ -13,7 +13,7 @@ from pydantic import BaseModel, Field
 app = FastAPI(
     title="Image Editor API",
     version="1.0.0",
-    description="AI image editing service powered by MagicEraser.",
+    description="AI image editing service powered by AIEnhancer.",
 )
 
 app.add_middleware(
@@ -23,6 +23,15 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+AES_KEY = b"ai-enhancer-web__aes-key"
+AES_IV = b"aienhancer-aesiv"
+
+HEADERS = {
+    "Content-Type": "application/json",
+    "Origin": "https://aienhancer.ai",
+    "Referer": "https://aienhancer.ai/ai-image-editor",
+}
 
 
 class EditRequest(BaseModel):
@@ -42,73 +51,73 @@ class RootResponse(BaseModel):
     message: str
 
 
-def generate_serial() -> str:
-    return "".join(random.choice("0123456789abcdef") for _ in range(32))
+def encrypt(obj: dict) -> str:
+    plaintext = json.dumps(obj).encode("utf-8")
+    padded = pad(plaintext, AES.block_size)
+    cipher = AES.new(AES_KEY, AES.MODE_CBC, AES_IV)
+    encrypted = cipher.encrypt(padded)
+    return base64.b64encode(encrypted).decode("utf-8")
 
 
-def detect_content_type(filename: str) -> str:
-    ext = os.path.splitext(filename)[1].lower()
-    if ext == ".png":
-        return "image/png"
-    return "image/jpeg"
-
-
-async def upload_filename(client: httpx.AsyncClient, filename: str) -> dict:
+async def nsfw_check(client: httpx.AsyncClient, image: str) -> str:
     response = await client.post(
-        "https://api.imgupscaler.ai/api/common/upload/upload-image",
-        data={"file_name": filename},
-        headers={
-            "origin": "https://imgupscaler.ai",
-            "referer": "https://imgupscaler.ai/",
-        },
+        "https://aienhancer.ai/api/v1/r/nsfw-detection",
+        json={"image": image},
+        headers=HEADERS,
     )
     response.raise_for_status()
-    return response.json()["result"]
+    task_id = response.json()["data"]["id"]
+
+    while True:
+        await asyncio.sleep(2)
+        res = await client.post(
+            "https://aienhancer.ai/api/v1/r/nsfw-detection/result",
+            json={"task_id": task_id},
+            headers=HEADERS,
+        )
+        res.raise_for_status()
+        data = res.json()["data"]
+        if data["status"] == "succeeded":
+            return data["output"]
 
 
-async def upload_to_oss(client: httpx.AsyncClient, put_url: str, image_bytes: bytes, content_type: str) -> bool:
-    response = await client.put(
-        put_url,
-        content=image_bytes,
-        headers={
-            "Content-Type": content_type,
-            "Content-Length": str(len(image_bytes)),
-        },
-    )
-    return response.status_code == 200
+async def image_editor(client: httpx.AsyncClient, image: str, prompt: str) -> dict:
+    settings = encrypt({
+        "prompt": prompt,
+        "size": "2K",
+        "aspect_ratio": "match_input_image",
+        "output_format": "jpeg",
+        "max_images": 1,
+    })
 
-
-async def create_job(client: httpx.AsyncClient, image_url: str, prompt: str) -> str:
     response = await client.post(
-        "https://api.magiceraser.org/api/magiceraser/v2/image-editor/create-job",
-        data={
-            "model_name": "magiceraser_v4",
-            "original_image_url": image_url,
-            "prompt": prompt,
-            "ratio": "match_input_image",
-            "output_format": "jpg",
+        "https://aienhancer.ai/api/v1/k/image-enhance/create",
+        json={
+            "model": 2,
+            "image": image,
+            "function": "ai-image-editor",
+            "settings": settings,
         },
-        headers={
-            "product-code": "magiceraser",
-            "product-serial": generate_serial(),
-            "origin": "https://imgupscaler.ai",
-            "referer": "https://imgupscaler.ai/",
-        },
+        headers=HEADERS,
     )
     response.raise_for_status()
-    return response.json()["result"]["job_id"]
+    task_id = response.json()["data"]["id"]
 
-
-async def check_job(client: httpx.AsyncClient, job_id: str) -> dict:
-    response = await client.get(
-        f"https://api.magiceraser.org/api/magiceraser/v1/ai-remove/get-job/{job_id}",
-        headers={
-            "origin": "https://imgupscaler.ai",
-            "referer": "https://imgupscaler.ai/",
-        },
-    )
-    response.raise_for_status()
-    return response.json()
+    while True:
+        await asyncio.sleep(2.5)
+        res = await client.post(
+            "https://aienhancer.ai/api/v1/k/image-enhance/result",
+            json={"task_id": task_id},
+            headers=HEADERS,
+        )
+        res.raise_for_status()
+        data = res.json()["data"]
+        if data["status"] == "success":
+            return {
+                "id": task_id,
+                "output": data["output"],
+                "input": data["input"],
+            }
 
 
 @app.get("/", response_model=RootResponse)
@@ -129,51 +138,25 @@ async def edit_image(request: EditRequest):
     if len(image_bytes) == 0:
         raise HTTPException(status_code=400, detail="Decoded image is empty.")
 
-    content_type = detect_content_type(request.filename)
+    b64 = base64.b64encode(image_bytes).decode("utf-8")
+    image_data_url = f"data:image/jpeg;base64,{b64}"
 
-    async with httpx.AsyncClient(timeout=httpx.Timeout(120.0)) as client:
+    async with httpx.AsyncClient(timeout=httpx.Timeout(300.0)) as client:
         try:
-            upload_result = await upload_filename(client, request.filename)
+            nsfw_result = await nsfw_check(client, image_data_url)
         except Exception:
-            raise HTTPException(status_code=502, detail="Failed to obtain upload URL.")
+            raise HTTPException(status_code=502, detail="Failed NSFW check.")
 
-        put_url = upload_result["url"]
-        object_name = upload_result["object_name"]
-
-        try:
-            success = await upload_to_oss(client, put_url, image_bytes, content_type)
-        except Exception:
-            raise HTTPException(status_code=502, detail="Failed to upload image to OSS.")
-
-        if not success:
-            raise HTTPException(status_code=502, detail="OSS upload returned non-200 status.")
-
-        cdn_url = "https://cdn.imgupscaler.ai/" + object_name
+        if nsfw_result != "normal":
+            raise HTTPException(status_code=400, detail="NSFW image blocked.")
 
         try:
-            job_id = await create_job(client, cdn_url, request.prompt)
+            result = await image_editor(client, image_data_url, request.prompt)
         except Exception:
-            raise HTTPException(status_code=502, detail="Failed to create editing job.")
-
-        try:
-            for _ in range(60):
-                await asyncio.sleep(3)
-                result = await check_job(client, job_id)
-                if result.get("code") != 300006:
-                    break
-            else:
-                raise HTTPException(status_code=504, detail="Job timed out.")
-        except HTTPException:
-            raise
-        except Exception:
-            raise HTTPException(status_code=502, detail="Failed to retrieve job status.")
-
-        output_urls = result.get("result", {}).get("output_url", [])
-        if not output_urls:
-            raise HTTPException(status_code=502, detail="No output image returned.")
+            raise HTTPException(status_code=502, detail="Failed to process image.")
 
         return EditResponse(
             success=True,
-            job_id=job_id,
-            image=output_urls[0],
+            job_id=result["id"],
+            image=result["output"],
         )
